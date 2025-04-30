@@ -62,6 +62,31 @@ def middleware(f):
 
     return decorated
 
+
+@user_blueprint.route('/check_token_validity', methods=['POST'])
+def check_token_validity():
+    try:
+        if 'Authorization' not in request.headers:
+            return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+        
+        authorization_bearer = request.headers['Authorization']     
+        refresh_token = authorization_bearer.split(" ")[1]
+
+        payload = jwt.decode(refresh_token, secret, algorithms=['HS256'])
+        user_id = payload.get('user_id')
+
+        if not r.exists(user_id):
+            return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+
+        return jsonify({"statuscode": 200, "message": "Token is valid"}), 200
+    except jwt.ExpiredSignatureError:
+        return jsonify({"statuscode": 401, "message": "Expired Refresh token"}), 200
+    except jwt.InvalidTokenError:
+        return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500 
+    
+
 @user_blueprint.route('/login', methods=['POST'])
 def login():
     try:
@@ -281,7 +306,7 @@ def verify_email():
         
         if login and login == True:
             access_token = generate_jwt(email, datetime.utcnow() + timedelta(minutes=1))
-            refresh_token = generate_jwt(email, datetime.utcnow() + timedelta(days=7))
+            refresh_token = generate_jwt(email, datetime.utcnow() + timedelta(minutes=3))
 
             r.set(email, refresh_token)
             return jsonify({"statuscode": 200, "message": "Email verified successfully.", "access_token": access_token, "refresh_token": refresh_token}), 200
@@ -476,7 +501,7 @@ def refresh_token():
             return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
 
         new_access_token = generate_jwt(user_id, datetime.utcnow() + timedelta(minutes=1))
-        new_refresh_token = generate_jwt(user_id, datetime.utcnow() + timedelta(days=7))
+        new_refresh_token = generate_jwt(user_id, datetime.utcnow() + timedelta(minutes=3))
 
         payload['exp'] = datetime.utcnow()
         r.set(user_id, new_refresh_token)
