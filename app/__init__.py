@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 from flask import Flask
-from app.routes.user_routes import user_blueprint
+from app.routes.user_routes import auth_api_blueprint
 import os
 from flask_cors import CORS
 from app.cache_config import cache
@@ -16,7 +16,7 @@ def create_app():
     app.secret_key = os.getenv("SECRET_KEY")
     
     # Register blueprints
-    app.register_blueprint(user_blueprint)
+    app.register_blueprint(auth_api_blueprint)
     
     # Cache configuration
     app.config['CACHE_TYPE'] = 'simple'

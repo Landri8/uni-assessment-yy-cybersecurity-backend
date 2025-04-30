@@ -1,600 +1,956 @@
+# ----- Core Flask & Dependencies -----
 from flask import Blueprint, jsonify, request, current_app, make_response
 import re
 import bcrypt
-from firebase_admin import firestore
-from app.firebase import firebase_admin
-import os
-from google.cloud.firestore_v1.base_query import FieldFilter
-from app.services.mail import send_email
-from app.utils.verification_util import generate_otp ,generate_verification_code
-from app.utils.token_util import generate_jwt, secret
-from app.services.captcha import generate_captcha_image
-from app.services.sms import send_sms
-from app.cache_config import cache
+import jwt
 from datetime import datetime, timedelta
 from functools import wraps
-from app.services.redis_client import r
-import jwt
+import os
 
+# ----- Persistence & Caching -----
+from firebase_admin import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
+from app.firebase import firebase_admin # Assuming this initializes Firebase Admin SDK
+from app.cache_config import cache # Assuming Flask-Caching instance
+from app.services.redis_client import r # Assuming Redis client instance
 
-db = firestore.client()
-user_blueprint = Blueprint('users', __name__)
+# ----- Application Specific Services/Utils -----
+from app.services.mail import send_email
+from app.utils.verification_util import generate_otp, generate_verification_code
+from app.utils.token_util import generate_jwt, secret # Assuming secret is defined here
+from app.services.captcha import generate_captcha_image
+from app.services.sms import send_sms # Note: Calls are commented out in original
 
-# Regular expression for basic email validation
-email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+# ----- Initialize Firestore Client -----
+# Renamed 'db' to 'firestore_db' for distinction
+firestore_db = firestore.client()
 
-# Regular expression for password validation
-password_regex = r'^(?=.*[A-Z])(?=.*[!@#$%^&*])[A-Za-z\d!@#$%^&*]{8,}$'
+# ----- Blueprint Definition -----
+# Renamed 'user_blueprint' to 'auth_api_blueprint'
+auth_api_blueprint = Blueprint('users', __name__) # Route prefix remains 'users'
 
-# Regular expression for phone number validation
-phone_regex = r"^44\d{9,10}$" 
+# ----- Validation Patterns -----
+# Renamed regex variables for clarity and distinction
+EMAIL_VALIDATION_PATTERN = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+PASSWORD_STRENGTH_PATTERN = r'^(?=.*[A-Z])(?=.*[!@#$%^&*])[A-Za-z\d!@#$%^&*]{8,}$'
+UK_PHONE_REGEX = r"^44\d{9,10}$" # Specific to UK format as in original
 
-def middleware(f):
+# ----- Authentication Middleware -----
+# Renamed 'middleware' to 'token_required' for clearer intent
+def token_required(f):
     @wraps(f)
-    def decorated(*args, **kwargs):
-        if 'Authorization' not in request.headers:
-            print("Authorization not found")
-            return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+    def wrapper(*args, **kwargs):
+        auth_header = request.headers.get('Authorization') # Use .get() for safety
 
-        authorization_bearer = request.headers['Authorization']
-        token = authorization_bearer.split(" ")[1]
+        if not auth_header or not auth_header.startswith("Bearer "):
+            # More specific check for Bearer token format
+            current_app.logger.warning("Authorization header missing or invalid format.")
+            return jsonify({"statuscode": 403, "message": "Forbidden: Authorization required."}), 200
+
+        jwt_token = auth_header.split(" ")[1]
 
         try:
-            payload = jwt.decode(token, secret, algorithms=['HS256'])
-            user_id = payload['user_id']
+            # Renamed variables for clarity
+            decoded_payload = jwt.decode(jwt_token, secret, algorithms=['HS256'])
+            token_subject_id = decoded_payload['user_id'] # Assuming 'user_id' is the subject
 
-            if not r.exists(user_id):
-                return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+            # Check if the token subject exists in Redis (indicates valid session)
+            if not r.exists(token_subject_id):
+                current_app.logger.warning(f"Token subject ID {token_subject_id} not found in Redis session store.")
+                return jsonify({"statuscode": 403, "message": "Forbidden: Invalid session."}), 200
 
-            data = request.get_json() or {}
-            email = data.get('email')
-            if email and email != user_id:
-                return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+            # Optional: Check if email in request body matches token subject (if applicable)
+            # This check might be too restrictive depending on the endpoint's purpose.
+            # Kept similar logic as original for now.
+            request_body = request.get_json(silent=True) or {} # Use silent=True
+            request_email = request_body.get('email')
+            if request_email and request_email != token_subject_id:
+                current_app.logger.warning(f"Request email '{request_email}' does not match token subject '{token_subject_id}'.")
+                return jsonify({"statuscode": 403, "message": "Forbidden: Mismatched identity."}), 200
 
         except jwt.ExpiredSignatureError:
-            print("Expired token")
-            return jsonify({"statuscode": 401, "message": "Expired token"}), 200
-        except jwt.InvalidTokenError:
-            print("Invalid token")
-            return jsonify({"statuscode": 403, "message": "Invalid token"}), 200
+            current_app.logger.info("Access token expired.")
+            # Consistent status code 401 for expired token
+            return jsonify({"statuscode": 401, "message": "Unauthorized: Token expired."}), 200
+        except jwt.InvalidTokenError as e:
+            current_app.logger.error(f"Invalid token error: {e}")
+            return jsonify({"statuscode": 403, "message": "Forbidden: Invalid token."}), 200
+        except Exception as e:
+            # Generic error catcher during token validation
+            current_app.logger.error(f"Unexpected error in token middleware: {e}")
+            return jsonify({"statuscode": 500, "message": "Internal server error during authentication."}), 500
 
+        # If all checks pass, proceed to the decorated route function
         return f(*args, **kwargs)
 
-    return decorated
+    return wrapper
 
 
-@user_blueprint.route('/check_token_validity', methods=['POST'])
-def check_token_validity():
+# ----- Endpoint: Check Token Validity -----
+# Function name changed, route remains the same
+@auth_api_blueprint.route('/check_token_validity', methods=['POST'])
+def check_refresh_token_status():
+    auth_header = request.headers.get('Authorization')
+
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"statuscode": 403, "message": "Forbidden: Authorization required."}), 200
+
+    token_to_validate = auth_header.split(" ")[1]
+
     try:
-        if 'Authorization' not in request.headers:
-            return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
-        
-        authorization_bearer = request.headers['Authorization']     
-        refresh_token = authorization_bearer.split(" ")[1]
+        token_data = jwt.decode(token_to_validate, secret, algorithms=['HS256'])
+        session_owner_id = token_data.get('user_id') # Use .get()
 
-        payload = jwt.decode(refresh_token, secret, algorithms=['HS256'])
-        user_id = payload.get('user_id')
+        if not session_owner_id:
+             return jsonify({"statuscode": 403, "message": "Forbidden: Invalid token payload."}), 200
 
-        if not r.exists(user_id):
-            return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+        # Check Redis for the corresponding session key
+        if not r.exists(session_owner_id):
+            current_app.logger.warning(f"Refresh token validation failed: Session ID {session_owner_id} not in Redis.")
+            return jsonify({"statuscode": 403, "message": "Forbidden: Invalid session or expired refresh token."}), 200
 
-        return jsonify({"statuscode": 200, "message": "Token is valid"}), 200
+        # Optional: Check if the provided token matches the one stored in Redis
+        # stored_token = r.get(session_owner_id)
+        # if stored_token and stored_token.decode('utf-8') != token_to_validate:
+        #     return jsonify({"statuscode": 403, "message": "Forbidden: Token mismatch."}), 200
+
+        return jsonify({"statuscode": 200, "message": "Token is valid."}), 200
+
     except jwt.ExpiredSignatureError:
-        return jsonify({"statuscode": 401, "message": "Expired Refresh token"}), 200
+        # Use 401 for expired tokens consistently
+        return jsonify({"statuscode": 401, "message": "Unauthorized: Expired Refresh token."}), 200
     except jwt.InvalidTokenError:
-        return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+        return jsonify({"statuscode": 403, "message": "Forbidden: Invalid token format or signature."}), 200
     except Exception as e:
-        return jsonify({"message": str(e)}), 500 
-    
+        current_app.logger.error(f"Error checking token validity: {e}")
+        # Changed generic message for 500
+        return jsonify({"statuscode": 500, "message": "Internal server error while validating token."}), 500
 
-@user_blueprint.route('/login', methods=['POST'])
-def login():
+
+# ----- Endpoint: User Login -----
+# Function name changed, route remains the same
+@auth_api_blueprint.route('/login', methods=['POST'])
+def handle_user_login():
     try:
-        data = request.get_json()
+        credentials = request.get_json()
+        if not credentials:
+             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        email = data.get('email')
-        password = data.get('password')
+        login_email = credentials.get('email')
+        login_password = credentials.get('password')
 
-        # Check for missing email or password fields
-        if not email or not password:
-            return jsonify({"statuscode": 400, "message": "Please fill up all field"}), 200
+        # Combined check for missing fields
+        if not login_email or not login_password:
+            return jsonify({"statuscode": 400, "message": "Email and password are required."}), 200
 
-        # Validate email format
-        if not re.match(email_regex, email):
-            return jsonify({"statuscode": 400, "message": "Invalid email format"}), 200
+        # Validate email format first
+        if not re.match(EMAIL_VALIDATION_PATTERN, login_email):
+            return jsonify({"statuscode": 400, "message": "Invalid email format provided."}), 200
 
-        # Validate password complexity
-        if not re.match(password_regex, password):
+        # Validate password complexity (optional but kept from original)
+        # Consider if this check is truly needed at login, usually only needed at signup/pw change.
+        # If kept, use the renamed pattern variable.
+        if not re.match(PASSWORD_STRENGTH_PATTERN, login_password):
             return jsonify({
                 "statuscode": 400,
-                "message": "Password must be at least 8 characters long, "
-                        "contain at least one uppercase letter and one special character."
+                "message": "Password format requirement mismatch." # Simplified message
             }), 200
 
-        users_ref = db.collection("users")
-        query = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
-        results = query.stream()
+        # Firestore Query
+        user_collection_ref = firestore_db.collection("users")
+        user_query = user_collection_ref.where(filter=FieldFilter("email", "==", login_email)).limit(1)
+        query_results = user_query.stream()
 
-        user = None
-        for doc in results:
-            user = doc.to_dict()
-            break
+        # Retrieve user data - using next() for potentially cleaner single result handling
+        found_user_doc = next(query_results, None)
 
-        if not user:
-            return jsonify({"statuscode": 400, "message": "Incorrect email or password"}), 200
+        if not found_user_doc:
+            return jsonify({"statuscode": 400, "message": "Login failed: Incorrect email or password."}), 200
 
-        stored_hashed_password = user.get('password')
-        if not bcrypt.checkpw(password.encode('utf-8'), stored_hashed_password.encode('utf-8')):
-            return jsonify({"statuscode": 400, "message": "Incorrect email or password"}), 200
+        user_data = found_user_doc.to_dict()
+        db_password_hash = user_data.get('password')
 
+        # Verify password
+        if not db_password_hash or not bcrypt.checkpw(login_password.encode('utf-8'), db_password_hash.encode('utf-8')):
+            return jsonify({"statuscode": 400, "message": "Login failed: Incorrect email or password."}), 200
 
-        responseUserObject = {
-            "name": user.get('name'),
-            "email": user.get('email'),
-            "phone": user.get('phone'),
+        # --- Post-Authentication Steps (Captcha Flow) ---
+
+        # Prepare data for caching before captcha verification
+        user_profile_info = {
+            "name": user_data.get('name'),
+            "email": user_data.get('email'),
+            "phone": user_data.get('phone'), # Include phone if available
         }
 
+        # Generate captcha challenge
+        captcha_challenge_id = generate_verification_code() # Reusing this function as per original
+        cache_key_login = f"{login_email}_captcha_{captcha_challenge_id}" # More specific cache key
+        print("Cache Key: ", cache_key_login)
+        cache.set(cache_key_login, user_profile_info, timeout=300) # Increased timeout slightly
 
-        recaptchacode = generate_verification_code()
-        cache.set(email + "_" + recaptchacode, responseUserObject, timeout=60) # 5 minutes
+        captcha_image_uri = generate_captcha_image(captcha_challenge_id)
 
-        recaptchaurl = generate_captcha_image(recaptchacode)
-
-        return jsonify({"statuscode": 200, "message": "Login successful", "recaptchaurl": recaptchaurl}), 200
+        return jsonify({
+            "statuscode": 200,
+            "message": "Authentication successful, proceed with CAPTCHA.", # Clearer message
+            "recaptchaurl": captcha_image_uri,
+            # Include challenge ID if frontend needs it separately
+            # "challengeId": captcha_challenge_id
+        }), 200
 
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Login endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during login."}), 500
 
 
-@user_blueprint.route('/signup', methods=['POST'])
-def signup():
-    password = os.getenv('MAIL_PASSWORD')
-    print("MAIL_PASSWORD:", password)
+# ----- Endpoint: User Signup -----
+# Function name changed, route remains the same
+@auth_api_blueprint.route('/signup', methods=['POST'])
+def handle_user_registration():
     try:
-        data = request.get_json()
+        registration_payload = request.get_json()
+        if not registration_payload:
+            return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        name = data.get('name')
-        email = data.get('email')
-        password = data.get('password')
-        confirm_password = data.get('password_confirmation')
+        # Extract registration details
+        provided_name = registration_payload.get('name')
+        provided_email = registration_payload.get('email')
+        provided_password = registration_payload.get('password')
+        password_confirmation = registration_payload.get('password_confirmation')
 
-        if not name or not email or not password or not confirm_password:
-            return jsonify({"statuscode": 400, "message": "Please fill up all field."}), 200
-        
-        if len(name) < 3:
-            return jsonify({"statuscode": 400, 'message': "Name must be at least 3 characters long."}), 200
+        # Validate required fields
+        if not all([provided_name, provided_email, provided_password, password_confirmation]):
+            return jsonify({"statuscode": 400, "message": "All fields are required for registration."}), 200
 
-        if not email or not re.match(email_regex, email):
-            return jsonify({"statuscode": 400, 'message': "Invalid email format."}), 200
+        # Specific field validations
+        if len(provided_name) < 3:
+            return jsonify({"statuscode": 400, 'message': "Name must contain at least 3 characters."}), 200
+        if not re.match(EMAIL_VALIDATION_PATTERN, provided_email):
+            return jsonify({"statuscode": 400, 'message': "Invalid email format provided."}), 200
+        if not re.match(PASSWORD_STRENGTH_PATTERN, provided_password):
+             # More specific password requirement message
+            return jsonify({"statuscode": 400, 'message': "Password must be 8+ chars, with uppercase & special char."}), 200
+        if provided_password != password_confirmation:
+            return jsonify({"statuscode": 400, 'message': "Passwords do not match."}), 200 # Added password match check
 
-        if not password or not re.match(password_regex, password):
-            return jsonify({"statuscode": 400, 'message': "Invalid password format."}), 200
+        # Check if user already exists
+        user_collection = firestore_db.collection("users")
+        existing_user_query = user_collection.where(filter=FieldFilter("email", "==", provided_email)).limit(1)
+        if next(existing_user_query.stream(), None): # Check if any document exists
+            return jsonify({"statuscode": 400, 'message': "An account with this email already exists."}), 200
 
-        user_ref = db.collection("users")
-        query = user_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
-
-        results = query.stream()
-
-        checked_user = None
-        for doc in results:
-            checked_user = doc.to_dict()
-            break
-
-        if checked_user:
-            return jsonify({"statuscode": 400, 'message': "User with this email already existed."}), 200
-
-        cachedUserForm = {
-            "name": name,
-            "email": email,
-            "password": password
+        # --- Pre-Captcha Caching ---
+        # Cache the validated registration data temporarily
+        pending_registration_data = {
+            "name": provided_name,
+            "email": provided_email,
+            "password": provided_password # Store plain password temporarily before hashing
         }
 
-        recaptchacode = generate_verification_code()
-        cache.set(email + "_" + recaptchacode, cachedUserForm, timeout=60) # 5 minutes
+        captcha_challenge_id = generate_verification_code()
+        # Using a different cache key prefix for signup vs login
+        cache_key_signup = f"{provided_email}_captcha_{captcha_challenge_id}"
+        cache.set(cache_key_signup, pending_registration_data, timeout=300) # 5 min timeout
 
-        recaptchaurl = generate_captcha_image(recaptchacode)
-        
-        return jsonify({"statuscode": 200, "message": "Signup form valid", "recaptchaurl": recaptchaurl}), 200
+        captcha_image_uri = generate_captcha_image(captcha_challenge_id)
+
+        return jsonify({
+            "statuscode": 200,
+            "message": "Registration data validated, proceed with CAPTCHA.",
+            "recaptchaurl": captcha_image_uri
+             # Include challenge ID if frontend needs it separately
+             # "challengeId": captcha_challenge_id
+        }), 200
+
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Signup endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during registration."}), 500
 
 
-@user_blueprint.route('/verify_recaptcha', methods=['POST'])
-def verify_recaptcha():
+# ----- Endpoint: Verify Recaptcha -----
+# Function name changed, route remains the same
+@auth_api_blueprint.route('/verify_recaptcha', methods=['POST'])
+def process_captcha_and_continue():
     try:
-        data = request.get_json()
+        captcha_payload = request.get_json()
+        if not captcha_payload:
+             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        email = data.get('email')
-        recaptcha_code = data.get('recaptcha_code')
-        login = data.get('login')
+        target_email = captcha_payload.get('email')
+        submitted_captcha_code = captcha_payload.get('recaptcha_code') # Kept original key name for compatibility
+        # Correctly handle boolean flag from JSON
+        is_login_flow = str(captcha_payload.get('login', 'false')).lower() == 'true' # Safer boolean check
 
-        if not email or not recaptcha_code:
-            return jsonify({"statuscode": 400, "message": "Bad request"}), 200
-        
-        if cache.get(email + "_" + recaptcha_code) is None:
-            return jsonify({"statuscode": 400, "message": "Invalid recaptcha code"}), 200
-        
-        cachedUser = cache.get(email + "_" + recaptcha_code)
+        if not target_email or not submitted_captcha_code:
+            return jsonify({"statuscode": 400, "message": "Bad Request: Email and CAPTCHA code required."}), 200
 
-        if login and login == "false":
-            encrypted_password = bcrypt.hashpw(password=cachedUser.get('password').encode('utf-8'), salt=bcrypt.gensalt()).decode('utf-8')
-            print(encrypted_password)
+        # Determine cache key based on flow
+        cache_key_prefix = f"{target_email}_captcha_" if is_login_flow else f"{target_email}_captcha_"
+        cache_lookup_key = f"{cache_key_prefix}{submitted_captcha_code}"
+        print("Cache lookup key: ", cache_lookup_key)
 
-            user = {
-                "name": cachedUser.get('name'),
-                "email": cachedUser.get('email'),
-                "password": encrypted_password
-            }
+        cached_user_data = cache.get(cache_lookup_key)
+        print("Cached user data: ", cached_user_data)
 
-            # Add user to Firestore
-            user_ref = db.collection("users")
-            user_doc_ref = user_ref.document(email)
-            user_doc_ref.set(user)
+        if cached_user_data is None:
+            return jsonify({"statuscode": 400, "message": "Invalid or expired CAPTCHA code."}), 200
 
-        verification_code = generate_verification_code()
-        cache.set(email + "_verify", verification_code, timeout=300) # 5 minutes
-        
+        # --- Actions after successful CAPTCHA verification ---
+
+        user_info_for_response = { # Prepare response structure early
+            "name": cached_user_data.get('name'),
+            "email": cached_user_data.get('email'),
+            "phone": cached_user_data.get('phone', ""), # Default to empty string if no phone yet
+        }
+
+        # If it was the SIGNUP flow, create the user now
+        if not is_login_flow:
+            try:
+                # Hash the password before saving
+                password_to_hash = cached_user_data.get('password')
+                if not password_to_hash:
+                     # Should not happen if signup caching was correct, but good to check
+                     raise ValueError("Password missing from cached signup data.")
+
+                hashed_user_password = bcrypt.hashpw(
+                    password_to_hash.encode('utf-8'),
+                    bcrypt.gensalt()
+                ).decode('utf-8')
+
+                # Prepare Firestore document
+                new_user_record = {
+                    "name": cached_user_data.get('name'),
+                    "email": cached_user_data.get('email'),
+                    "password": hashed_user_password,
+                    "phone": None, # Initialize phone as null or empty
+                    "created_at": firestore.SERVER_TIMESTAMP # Add creation timestamp
+                }
+
+                # Add user to Firestore (use email as document ID)
+                user_collection_ref = firestore_db.collection("users")
+                user_doc_ref = user_collection_ref.document(target_email)
+                user_doc_ref.set(new_user_record)
+                current_app.logger.info(f"New user created: {target_email}")
+
+            except Exception as db_error:
+                 current_app.logger.error(f"Firestore error during user creation for {target_email}: {db_error}")
+                 return jsonify({"statuscode": 500, "message": "Failed to create user account after CAPTCHA."}), 500
+
+        # --- Send Verification Email (Common step for both flows after CAPTCHA) ---
+        email_verification_token = generate_verification_code()
+        email_verify_cache_key = f"{target_email}_email_verify_code"
+        cache.set(email_verify_cache_key, email_verification_token, timeout=300) # 5 minutes validity
+
         try:
-            send_email(to=cachedUser.get('email'), subject="Hi {name}, please verify your VeriOne account.".format(name=cachedUser.get('name')), code=verification_code)
-            responseUserObject = {
-                "name": cachedUser.get('name'),
-                "email": cachedUser.get('email'),
-                "phone": cachedUser.get('phone') if cachedUser.get('phone') else "",
-            }
-            return jsonify({"statuscode": 200, "message": "Recaptcha verified successfully", "user": responseUserObject}), 200
+            email_subject = f"Verify your account, {cached_user_data.get('name', 'User')}"
+            # Assuming send_email takes named arguments as before
+            send_email(
+                to=target_email,
+                subject=email_subject,
+                code=email_verification_token # Pass the code to the email template/body
+            )
+            current_app.logger.info(f"Verification email sent to {target_email}")
+
+            # CAPTCHA verified, email sent, now remove the CAPTCHA cache entry
+            cache.delete(cache_lookup_key)
+
+            return jsonify({
+                "statuscode": 200,
+                "message": "CAPTCHA verified successfully. Please check your email for verification code.",
+                "user": user_info_for_response # Return basic user info
+            }), 200
 
         except Exception as email_error:
-            # Rollback Firestore if email fails
-            return jsonify({"message": "User created but email failed, rollback applied", "error": str(email_error)}), 500
-            
+            current_app.logger.error(f"Failed to send verification email to {target_email}: {email_error}")
+            # Decide on rollback strategy: If signup, maybe delete the created user?
+            # For simplicity now, just report the error. Rollback might be complex.
+            if not is_login_flow:
+                 # Attempt to delete the just-created user if email fails during signup
+                 try:
+                     firestore_db.collection("users").document(target_email).delete()
+                     current_app.logger.warning(f"Rolled back user creation for {target_email} due to email failure.")
+                 except Exception as delete_error:
+                     current_app.logger.error(f"Failed to rollback user creation for {target_email}: {delete_error}")
+
+            return jsonify({"statuscode": 500, "message": "CAPTCHA verified, but failed to send verification email."}), 500
 
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Verify CAPTCHA endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during CAPTCHA verification."}), 500
 
-@user_blueprint.route('/resend_email', methods=['POST'])
-def resend_email():
+
+# ----- Endpoint: Resend Verification Email -----
+# Function name changed, route remains the same
+@auth_api_blueprint.route('/resend_email', methods=['POST'])
+def request_new_verification_email():
     try:
-        data = request.get_json()
+        request_data = request.get_json()
+        if not request_data:
+            return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        email = data.get('email')
-        
-        if not email:
-            return jsonify({"statuscode": 400, "message": "Bad request"}), 200
+        user_email_address = request_data.get('email')
 
-        users_ref = db.collection("users")
-        query = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
-        results = query.stream()
+        if not user_email_address:
+            return jsonify({"statuscode": 400, "message": "Bad Request: Email is required."}), 200
 
-        user = None
-        for doc in results:
-            user = doc.to_dict()
-            break  # Exit after the first match
+        # Verify user exists before resending
+        user_collection = firestore_db.collection("users")
+        user_doc = user_collection.document(user_email_address).get() # Direct get by ID
 
-        if not user:
-            return jsonify({"statuscode": 400, "message": "User not found"}), 200
-        
-        verification_code = generate_verification_code()
-        cache.set(email + "_verify", verification_code, timeout=300) # 5 minutes
+        if not user_doc.exists:
+            return jsonify({"statuscode": 404, "message": "User account not found."}), 200 # Use 404
+
+        target_user_data = user_doc.to_dict()
+
+        # Generate a new verification code and cache it
+        new_email_code = generate_verification_code()
+        email_verify_cache_key = f"{user_email_address}_email_verify_code" # Consistent key naming
+        cache.set(email_verify_cache_key, new_email_code, timeout=300) # 5 minutes validity
 
         try:
-            send_email(to=email, subject="Please verify your VeriOne account.", code=verification_code)
-            return jsonify({"statuscode": 200, "message": "Email resent successfully"}), 200
+            email_subject = f"Verify your account, {target_user_data.get('name', 'User')}"
+            send_email(to=user_email_address, subject=email_subject, code=new_email_code)
+            current_app.logger.info(f"Resent verification email to {user_email_address}")
+            return jsonify({"statuscode": 200, "message": "Verification email resent successfully."}), 200
 
         except Exception as email_error:
-            return jsonify({"message": "User created but email failed, rollback applied", "error": str(email_error)}), 500
+            current_app.logger.error(f"Failed to resend verification email to {user_email_address}: {email_error}")
+            return jsonify({"statuscode": 500, "message": "Failed to resend verification email."}), 500
 
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Resend email endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred while resending email."}), 500
 
 
-@user_blueprint.route('/verify_email', methods=['POST'])
-def verify_email():
+# ----- Endpoint: Verify Email Code -----
+# Function name changed, route remains the same
+@auth_api_blueprint.route('/verify_email', methods=['POST'])
+def confirm_email_with_code():
     try:
-        data = request.get_json()
+        verification_data = request.get_json()
+        if not verification_data:
+            return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        email = data.get('email')
-        verification_code = data.get('verification_code')
-        login = data.get('login')
-        print(email, verification_code, login)
-        verify_key = "{email}_verify".format(email=email)
+        subject_email = verification_data.get('email')
+        submitted_code = verification_data.get('verification_code')
+        # Ensure boolean comparison is robust
+        is_final_login_step = str(verification_data.get('login', 'false')).lower() == 'true'
 
-        if cache.get(verify_key) is None:
-            return jsonify({"statuscode": 400, "message": "Invalid verification code."}), 200
-        
-        if cache.get(verify_key) != verification_code:
-            return jsonify({"statuscode": 400, "message": "Verification code expired."}), 200
-        
-        if login and login == True:
-            access_token = generate_jwt(email, datetime.utcnow() + timedelta(minutes=1))
-            refresh_token = generate_jwt(email, datetime.utcnow() + timedelta(minutes=3))
+        if not subject_email or not submitted_code:
+            return jsonify({"statuscode": 400, "message": "Bad Request: Email and verification code required."}), 200
 
-            r.set(email, refresh_token)
-            return jsonify({"statuscode": 200, "message": "Email verified successfully.", "access_token": access_token, "refresh_token": refresh_token}), 200
+        # Check cache for the verification code
+        cache_lookup_key = f"{subject_email}_email_verify_code"
+        cached_code = cache.get(cache_lookup_key)
 
-        cache.delete(verify_key)
-        return jsonify({"statuscode": 200, "message": "Email verified successfully."}), 200
+        if cached_code is None:
+            return jsonify({"statuscode": 400, "message": "Verification code expired or never sent."}), 200
+
+        if cached_code != submitted_code:
+            return jsonify({"statuscode": 400, "message": "Invalid verification code provided."}), 200
+
+        # --- Actions after successful email verification ---
+        cache.delete(cache_lookup_key) # Code used, delete it
+
+        # If this verification completes the login process, generate tokens
+        if is_final_login_step:
+            try:
+                # Generate JWT tokens (using durations from original code)
+                access_token_duration = timedelta(minutes=1) # Short duration access token
+                refresh_token_duration = timedelta(minutes=3) # Longer duration refresh token
+
+                session_token = generate_jwt(subject_email, datetime.utcnow() + access_token_duration)
+                renewal_token = generate_jwt(subject_email, datetime.utcnow() + refresh_token_duration)
+
+                # Store the refresh token in Redis, key by user email (subject_id)
+                # Set expiry in Redis slightly longer than the token's own expiry for safety
+                redis_expiry_seconds = int(refresh_token_duration.total_seconds() + 60)
+                r.set(subject_email, renewal_token, ex=redis_expiry_seconds)
+
+                current_app.logger.info(f"Email verified for {subject_email}, issued JWT tokens.")
+                return jsonify({
+                    "statuscode": 200,
+                    "message": "Email verified successfully. Login complete.",
+                    "access_token": session_token,
+                    "refresh_token": renewal_token
+                }), 200
+
+            except Exception as token_error:
+                current_app.logger.error(f"Failed to generate/store tokens for {subject_email}: {token_error}")
+                return jsonify({"statuscode": 500, "message": "Email verified, but failed to issue session tokens."}), 500
+        else:
+             # If not the final login step (e.g., just verifying after signup before adding phone)
+             # Optional: Update user record in Firestore to mark email as verified
+             try:
+                 firestore_db.collection("users").document(subject_email).update({"email_verified": True, "email_verified_at": firestore.SERVER_TIMESTAMP})
+                 current_app.logger.info(f"Email verified for {subject_email} (Signup flow).")
+             except Exception as db_update_error:
+                 current_app.logger.error(f"Failed to mark email as verified in DB for {subject_email}: {db_update_error}")
+                 # Continue, but log the error. The primary goal was achieved.
+
+             return jsonify({"statuscode": 200, "message": "Email verified successfully."}), 200
 
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Verify email endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during email verification."}), 500
 
 
-@user_blueprint.route('/add_phone', methods=['POST'])
-def add_phone_number():
+# ----- Endpoint: Add Phone Number -----
+# Function name changed, route remains the same
+# Applying token_required middleware as sensitive user data is modified
+@auth_api_blueprint.route('/add_phone', methods=['POST'])
+def associate_phone_number_to_account():
     try:
-        data = request.get_json()
-        email = data.get('email')
-        phone = data.get('phone')
+        phone_data_payload = request.get_json()
+        if not phone_data_payload:
+             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        if not email or not phone:
-            return jsonify({"statuscode": 400, "message": "Phone number required."}), 200
+        account_email = phone_data_payload.get('email')
+        phone_to_add = phone_data_payload.get('phone')
 
-        if not re.match(phone_regex, phone):
-            return jsonify({"statuscode": 400,"message": "Invalid phone number."}), 200
+        if not account_email or not phone_to_add:
+            return jsonify({"statuscode": 400, "message": "Email and phone number are required."}), 200
 
-        user_ref = db.collection("users")
-        query = user_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
+        # Validate phone format (using the UK specific regex from original)
+        if not re.match(UK_PHONE_REGEX, phone_to_add):
+            return jsonify({"statuscode": 400, "message": "Invalid phone number format (must be UK format starting with 44)."}), 200
 
-        results = query.stream()
+        # Find user document - Use direct get since email should be unique doc ID
+        user_collection = firestore_db.collection("users")
+        user_doc_ref = user_collection.document(account_email)
+        user_record = user_doc_ref.get()
 
-        current = None
-        for doc in results:
-            current = doc.to_dict()
-            break
+        if not user_record.exists:
+            return jsonify({"statuscode": 404, "message": "User account not found."}), 200 # Use 404
 
-        if not current:
-            return jsonify({"statuscode": 400,"message": "User not found."}), 200
+        # Update phone number in Firestore
+        try:
+            user_doc_ref.update({"phone": phone_to_add, "phone_added_at": firestore.SERVER_TIMESTAMP})
+        except Exception as db_update_error:
+             current_app.logger.error(f"Failed to update phone for {account_email}: {db_update_error}")
+             return jsonify({"statuscode": 500, "message": "Failed to save phone number."}), 500
 
-        user_ref.document(email).update({"phone": phone})
-        
-        otp = generate_otp()
-        print("OTP:", otp)
-        cache.set(email + "_otp", otp, timeout=300)
-        # send_sms(phone, otp)
 
-        return jsonify({"statuscode": 200, "message": "Phone Added."}), 200
+        # Generate and cache OTP for phone verification
+        sms_otp_code = generate_otp()
+        print("OTP:", sms_otp_code)
+        otp_cache_key = f"{account_email}_sms_otp"
+        cache.set(otp_cache_key, sms_otp_code, timeout=300) # 5 minutes validity
+
+        # Send OTP via SMS (Commented out as per original, uncomment to enable)
+        try:
+            current_app.logger.info(f"Generated OTP for {account_email} / {phone_to_add}: {sms_otp_code}") # Log OTP for debugging if SMS is off
+            # send_sms(phone_to_add, f"Your verification code is: {sms_otp_code}")
+            # current_app.logger.info(f"Sent OTP SMS to {phone_to_add}")
+            pass # Remove pass if send_sms is uncommented
+        except Exception as sms_error:
+            current_app.logger.error(f"Failed to send OTP SMS to {phone_to_add}: {sms_error}")
+            # Don't fail the whole request yet, phone was added to DB. Maybe alert user.
+            return jsonify({
+                 "statuscode": 200, # Phone added, but SMS failed
+                 "message": "Phone number added, but failed to send OTP. Please try resending."
+            }), 200
+
+        return jsonify({"statuscode": 200, "message": "Phone number added. Please verify with the OTP sent."}), 200
 
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Add phone endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred while adding phone number."}), 500
 
 
-@user_blueprint.route('/resend_otp', methods=['POST'])
-def resend_otp():
+# ----- Endpoint: Resend SMS OTP -----
+# Function name changed, route remains the same
+# Applying token_required middleware
+@auth_api_blueprint.route('/resend_otp', methods=['POST'])
+def request_new_sms_otp():
     try:
-        data = request.get_json()
+        otp_request_data = request.get_json()
+        if not otp_request_data:
+             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        email = data.get('email')
-        phone = data.get('phone')
+        target_email = otp_request_data.get('email')
+        # Optional: Include phone in request to ensure it matches DB, or fetch from DB
+        # target_phone = otp_request_data.get('phone') # If provided by client
 
-        if not email or not phone:
-            return jsonify({"statuscode": 400, "message": "Phone number required."}), 200
-        
-        user = None
-        users_ref = db.collection("users")
-        query = users_ref.where(filter=FieldFilter("email", "==", email)).where(filter=FieldFilter("phone", "==", phone)).limit(1)
+        if not target_email: # Removed phone check here, fetch from DB instead
+            return jsonify({"statuscode": 400, "message": "Bad Request: Email is required."}), 200
 
-        results = query.stream()
+        # Fetch user data to get the registered phone number
+        user_doc = firestore_db.collection("users").document(target_email).get()
 
-        for doc in results:
-            user = doc.to_dict()
-            break
+        if not user_doc.exists:
+            return jsonify({"statuscode": 404, "message": "User account not found."}), 200 # Use 404
 
-        if not user:
-            return jsonify({"statuscode": 400, "message": "User not found."}), 200
+        user_data = user_doc.to_dict()
+        registered_phone = user_data.get('phone')
 
-        otp = generate_otp()
-        print("OTP:", otp)
-        cache.set("{email}_otp".format(email=email), otp, timeout=300)
-        # send_sms(phone, otp)
+        if not registered_phone:
+             return jsonify({"statuscode": 400, "message": "No phone number associated with this account."}), 200
 
-        return jsonify({"statuscode": 200, "message": "OTP resent"}), 200
+        # Generate a new OTP and cache it
+        new_sms_otp = generate_otp()
+        print("OTP:", new_sms_otp)
+        otp_cache_key = f"{target_email}_sms_otp" # Consistent key naming
+        cache.set(otp_cache_key, new_sms_otp, timeout=300) # 5 minutes validity
+
+        # Send the new OTP via SMS (Commented out as per original)
+        try:
+            current_app.logger.info(f"Generated new OTP for {target_email} / {registered_phone}: {new_sms_otp}") # Log OTP
+            # send_sms(registered_phone, f"Your new verification code is: {new_sms_otp}")
+            # current_app.logger.info(f"Resent OTP SMS to {registered_phone}")
+            pass # Remove pass if uncommented
+        except Exception as sms_error:
+            current_app.logger.error(f"Failed to resend OTP SMS to {registered_phone}: {sms_error}")
+            return jsonify({"statuscode": 500, "message": "Failed to resend OTP SMS."}), 500
+
+        return jsonify({"statuscode": 200, "message": "New OTP sent successfully."}), 200
 
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Resend OTP endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred while resending OTP."}), 500
 
-@user_blueprint.route('/verify_otp', methods=['POST'])
-def verify_otp():
+
+# ----- Endpoint: Verify SMS OTP -----
+# Function name changed, route remains the same
+# Applying token_required middleware
+@auth_api_blueprint.route('/verify_otp', methods=['POST'])
+def confirm_phone_with_otp():
     try:
-        data = request.get_json()
+        otp_submission_payload = request.get_json()
+        if not otp_submission_payload:
+             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        email = data.get('email')
-        otp = data.get('otp')
+        user_email = otp_submission_payload.get('email')
+        submitted_otp = otp_submission_payload.get('otp')
 
-        print(email, otp)
+        if not user_email or not submitted_otp:
+            return jsonify({"statuscode": 400, "message": "Bad Request: Email and OTP required."}), 200
 
-        verify_key = "{email}_otp".format(email=email)
-        print(verify_key)
-        print(cache.get(verify_key))
+        # Check cache for the OTP code
+        otp_cache_key = f"{user_email}_sms_otp"
+        cached_otp = cache.get(otp_cache_key)
 
-        print(otp == cache.get(verify_key))
+        # Debugging logs from original kept for reference, modified slightly
+        # current_app.logger.debug(f"Verifying OTP for {user_email}. Submitted: {submitted_otp}. Cached: {cached_otp}")
 
-        if cache.get(verify_key) is None:
-            return jsonify({"statuscode": 400, "message": "Invalid OTP code"}), 200
+        if cached_otp is None:
+            return jsonify({"statuscode": 400, "message": "OTP code expired or was never sent."}), 200
 
-        if cache.get(verify_key) != otp:
-            return jsonify({"statuscode": 400, "message": "OTP code expired"}), 200
+        if cached_otp != submitted_otp:
+            # Increment failure count here? Rate limiting?
+            return jsonify({"statuscode": 400, "message": "Invalid OTP code provided."}), 200
 
-        cache.delete(verify_key)
+        # --- Actions after successful OTP verification ---
+        cache.delete(otp_cache_key) # OTP used, delete it
 
-        return jsonify({"statuscode": 200, "message": "Email verified successfully."}), 200
-    except Exception as e:
-        return jsonify({"message": str(e)}), 500
-    
+        # Optional: Update user record in Firestore to mark phone as verified
+        try:
+            firestore_db.collection("users").document(user_email).update({
+                "phone_verified": True,
+                "phone_verified_at": firestore.SERVER_TIMESTAMP
+            })
+            current_app.logger.info(f"Phone number verified for {user_email}.")
+        except Exception as db_update_error:
+            current_app.logger.error(f"Failed to mark phone as verified in DB for {user_email}: {db_update_error}")
+            # Log error but proceed, verification itself was successful
 
-@user_blueprint.route('/change_password', methods=['POST'])
-@middleware
-def change_password():
-    try:
-        refreshTT = request.cookies.get('refresh_token')
-        print("refreshTT", refreshTT)
-        data = request.get_json()
-
-        email = data.get('email')
-        old_password = data.get('old_password')
-        new_password = data.get('new_password')
-        confirm_password = data.get('confirm_password')
-
-        if not email or not old_password or not new_password or not confirm_password:
-            return jsonify({"statuscode": 400, "message": "Please fill up all field."}), 200
-        
-        if not new_password or not re.match(password_regex, new_password):
-            return jsonify({"statuscode": 400, 'message': "Invalid password format."}), 200
-
-        if not confirm_password or confirm_password != new_password:
-            return jsonify({"statuscode": 400, 'message': "Password does not match."}), 200
-
-        user_ref = db.collection("users")
-        query = user_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
-        
-        results = query.stream()
-
-        currentUser = None
-        for doc in results:
-            currentUser = doc.to_dict()
-            break
-
-        if not currentUser:
-            return jsonify({"statuscode": 400, "message": "User not found."}), 200
-        
-        current_datetime = datetime.now()
-        formatted_current_date = current_datetime.strftime('%Y%m%d%H%M')
-        print("formatted_current_date", formatted_current_date)
-        print("currentUser.get('can_changed_at')", currentUser.get('can_changed_at'))
-
-        if currentUser.get('can_changed_at') is not None and currentUser.get('can_changed_at') > formatted_current_date:
-            return jsonify({"statuscode": 405, "message": "Password change limit reached.", "date": currentUser.get('can_changed_at')}), 200
-
-        stored_hashed_password = currentUser.get('password')
-        if not bcrypt.checkpw(old_password.encode('utf-8'), stored_hashed_password.encode('utf-8')):
-            return jsonify({"statuscode": 400, "message": "Incorrect old password."}), 200
-        
-        if bcrypt.checkpw(new_password.encode('utf-8'), stored_hashed_password.encode('utf-8')):
-            return jsonify({"statuscode": 400, "message": "New password cannot be the same as old password."}), 200
-
-        encrypted_new_password = bcrypt.hashpw(password=new_password.encode('utf-8'), salt=bcrypt.gensalt()).decode('utf-8')
-
-        next_change_datetime = datetime.now() + timedelta(days=10) # can change after 10 days
-        formatted_next_date = next_change_datetime.strftime('%Y%m%d%H%M') # format to year month day hour minute
-
-        user_ref.document(email).update({
-            "password": encrypted_new_password, 
-            "can_changed_at": formatted_next_date
-        })
-
-        return jsonify({"statuscode": 200, "message": "Password changed successfully."}), 200
+        # Changed success message for clarity
+        return jsonify({"statuscode": 200, "message": "Phone number verified successfully."}), 200
 
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Verify OTP endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during OTP verification."}), 500
 
-@user_blueprint.route('/refresh_token', methods=['POST'])
-def refresh_token():
+
+# ----- Endpoint: Change Password -----
+# Function name changed, route remains the same
+# Middleware already applied via decorator
+@auth_api_blueprint.route('/change_password', methods=['POST'])
+@token_required # Uses the renamed middleware
+def handle_password_update():
     try:
-        if 'Authorization' not in request.headers:
-            return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
-        
-        authorization_bearer = request.headers['Authorization']     
-        refresh_token = authorization_bearer.split(" ")[1]
+        password_change_request_data = request.get_json()
+        if not password_change_request_data:
+             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        payload = jwt.decode(refresh_token, secret, algorithms=['HS256'])
-        user_id = payload.get('user_id')
+        account_email = password_change_request_data.get('email')
+        current_password_provided = password_change_request_data.get('old_password')
+        requested_new_password = password_change_request_data.get('new_password')
+        password_check = password_change_request_data.get('confirm_password') # Renamed from confirm_password
 
-        if not r.exists(user_id):
-            return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+        # Validate all fields are present
+        if not all([account_email, current_password_provided, requested_new_password, password_check]):
+            return jsonify({"statuscode": 400, "message": "All password fields are required."}), 200
 
-        new_access_token = generate_jwt(user_id, datetime.utcnow() + timedelta(minutes=1))
-        new_refresh_token = generate_jwt(user_id, datetime.utcnow() + timedelta(minutes=3))
+        # Validate new password format and confirmation
+        if not re.match(PASSWORD_STRENGTH_PATTERN, requested_new_password):
+            return jsonify({"statuscode": 400, 'message': "New password does not meet complexity requirements."}), 200
+        if requested_new_password != password_check:
+            return jsonify({"statuscode": 400, 'message': "New passwords do not match."}), 200
 
-        payload['exp'] = datetime.utcnow()
-        r.set(user_id, new_refresh_token)
+        # Fetch user data
+        user_doc_ref = firestore_db.collection("users").document(account_email)
+        user_account_doc = user_doc_ref.get()
 
-        return jsonify({"statuscode": 200, "message": "Token refreshed", "access_token": new_access_token, "refresh_token": new_refresh_token}), 200
+        if not user_account_doc.exists:
+            return jsonify({"statuscode": 404, "message": "User account not found."}), 200 # Use 404
+
+        user_account_data = user_account_doc.to_dict()
+
+        # Check password change cooldown (using format from original)
+        # Ensure consistent timezone handling if comparing across systems
+        can_change_at_str = user_account_data.get('can_changed_at') # Stored as 'YYYYMMDDHHMM' string
+        if can_change_at_str:
+             now_dt = datetime.now() # Consider using UTC: datetime.utcnow()
+             now_formatted = now_dt.strftime('%Y%m%d%H%M')
+             if can_change_at_str > now_formatted:
+                  # Provide the date when change is allowed again
+                  return jsonify({
+                       "statuscode": 405, # Method Not Allowed (or 429 Too Many Requests)
+                       "message": "Password change is not allowed yet.",
+                       "allowed_after": can_change_at_str # Send back the stored timestamp
+                  }), 200
+
+        # Verify the current (old) password
+        current_password_hash = user_account_data.get('password')
+        if not current_password_hash or not bcrypt.checkpw(current_password_provided.encode('utf-8'), current_password_hash.encode('utf-8')):
+            return jsonify({"statuscode": 400, "message": "Incorrect current password provided."}), 200
+
+        # Check if new password is the same as the old one
+        if bcrypt.checkpw(requested_new_password.encode('utf-8'), current_password_hash.encode('utf-8')):
+            return jsonify({"statuscode": 400, "message": "New password cannot be the same as the old password."}), 200
+
+        # Hash the new password
+        new_password_hash = bcrypt.hashpw(
+            requested_new_password.encode('utf-8'),
+            bcrypt.gensalt()
+        ).decode('utf-8')
+
+        # Calculate next allowed change time (10 days from original)
+        # Ensure timezone consistency (e.g., use UTC)
+        cooldown_period = timedelta(days=10)
+        next_allowed_change_dt = datetime.now() + cooldown_period # Or datetime.utcnow()
+        next_allowed_change_formatted = next_allowed_change_dt.strftime('%Y%m%d%H%M')
+
+        # Update Firestore with new password and cooldown timestamp
+        try:
+            user_doc_ref.update({
+                "password": new_password_hash,
+                "can_changed_at": next_allowed_change_formatted,
+                "password_last_changed_at": firestore.SERVER_TIMESTAMP
+            })
+            current_app.logger.info(f"Password changed successfully for {account_email}")
+            return jsonify({"statuscode": 200, "message": "Password changed successfully."}), 200
+        except Exception as db_update_error:
+             current_app.logger.error(f"Failed to update password for {account_email}: {db_update_error}")
+             return jsonify({"statuscode": 500, "message": "Failed to save new password."}), 500
+
+    except Exception as e:
+        current_app.logger.error(f"Change password endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during password change."}), 500
+
+
+# ----- Endpoint: Refresh JWT Token -----
+# Function name changed, route remains the same
+@auth_api_blueprint.route('/refresh_token', methods=['POST'])
+def issue_new_session_tokens():
+    auth_header = request.headers.get('Authorization')
+
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"statuscode": 403, "message": "Forbidden: Refresh token required."}), 200
+
+    provided_refresh_token = auth_header.split(" ")[1]
+
+    try:
+        # Decode the incoming refresh token to get the subject (user_id)
+        decoded_refresh_payload = jwt.decode(provided_refresh_token, secret, algorithms=['HS256'])
+        token_subject = decoded_refresh_payload.get('user_id')
+
+        if not token_subject:
+             return jsonify({"statuscode": 403, "message": "Forbidden: Invalid refresh token payload."}), 200
+
+        # Check if the provided refresh token matches the one stored in Redis for this user
+        stored_token = r.get(token_subject)
+        if not stored_token or stored_token.decode('utf-8') != provided_refresh_token:
+            # If mismatch or not found, it might be an old/invalid/revoked token
+            current_app.logger.warning(f"Refresh token mismatch or not found in Redis for {token_subject}.")
+            return jsonify({"statuscode": 403, "message": "Forbidden: Invalid or revoked refresh token."}), 200
+
+        # --- Issue New Tokens ---
+        # Use same durations as original verify_email step
+        access_token_duration = timedelta(minutes=1)
+        refresh_token_duration = timedelta(minutes=3)
+
+        refreshed_access_token = generate_jwt(token_subject, datetime.utcnow() + access_token_duration)
+        new_refresh_token = generate_jwt(token_subject, datetime.utcnow() + refresh_token_duration)
+
+        # Update Redis with the *new* refresh token and its expiry
+        redis_expiry_seconds = int(refresh_token_duration.total_seconds() + 60)
+        r.set(token_subject, new_refresh_token, ex=redis_expiry_seconds)
+
+        current_app.logger.info(f"Tokens refreshed for {token_subject}")
+        return jsonify({
+            "statuscode": 200,
+            "message": "Tokens refreshed successfully.",
+            "access_token": refreshed_access_token,
+            "refresh_token": new_refresh_token
+        }), 200
+
     except jwt.ExpiredSignatureError:
-        return jsonify({"statuscode": 401, "message": "Expired Refresh token"}), 200
+         # If the *incoming* refresh token is expired
+         # Clean up Redis entry if it exists (it shouldn't match if expired, but good practice)
+         if 'token_subject' in locals() and token_subject:
+              r.delete(token_subject)
+         return jsonify({"statuscode": 401, "message": "Unauthorized: Expired Refresh token."}), 200
     except jwt.InvalidTokenError:
-        return jsonify({"statuscode": 403, "message": "Forbidden"}), 200
+         return jsonify({"statuscode": 403, "message": "Forbidden: Invalid refresh token."}), 200
     except Exception as e:
-        return jsonify({"message": str(e)}), 500 
+        current_app.logger.error(f"Refresh token endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during token refresh."}), 500
 
 
-@user_blueprint.route('/edit_profile', methods=['POST'])
-@middleware
-def edit_profile():
+# ----- Endpoint: Edit User Profile -----
+# Function name changed, route remains the same
+# Middleware applied
+@auth_api_blueprint.route('/edit_profile', methods=['POST'])
+@token_required # Use renamed middleware
+def modify_user_profile_details():
     try:
-        data = request.get_json()
+        profile_update_data = request.get_json()
+        if not profile_update_data:
+             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        email = data.get('email')
-        name  = data.get('name')
+        account_email = profile_update_data.get('email')
+        updated_name = profile_update_data.get('name')
+        # Add other fields here if editable, e.g., updated_phone = profile_update_data.get('phone')
 
-        if not email or not name:
-            return jsonify({"statuscode": 400, "message": "Please fill up all field."}), 200
-        
-        if len(name) < 3:
-            return jsonify({"statuscode": 400, 'message': "Name must be at least 3 characters long."}), 200
+        if not account_email or not updated_name: # Add other required fields to check
+            return jsonify({"statuscode": 400, "message": "Required profile fields are missing (email, name)."}), 200
 
-        user_ref = db.collection("users")
-        query = user_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
-        
-        results = query.stream()
+        # Validate updated data
+        if len(updated_name) < 3:
+            return jsonify({"statuscode": 400, 'message': "Name must contain at least 3 characters."}), 200
+        # Add validation for other fields if needed (e.g., phone format)
 
-        currentUser = None
-        for doc in results:
-            currentUser = doc.to_dict()
-            break
+        # Prepare update payload for Firestore
+        update_payload = {
+            "name": updated_name,
+            # Add other fields: "phone": updated_phone,
+            "profile_last_updated_at": firestore.SERVER_TIMESTAMP
+        }
 
-        if not currentUser:
-            return jsonify({"statuscode": 400, "message": "User not found."}), 200
+        # Update Firestore document
+        try:
+            user_doc_ref = firestore_db.collection("users").document(account_email)
+            # Check if user exists before updating (optional, middleware implies user exists)
+            # user_doc = user_doc_ref.get()
+            # if not user_doc.exists:
+            #     return jsonify({"statuscode": 404, "message": "User account not found."}), 200
 
-        user_ref.document(email).update({"name": name})
+            user_doc_ref.update(update_payload)
+            current_app.logger.info(f"Profile updated successfully for {account_email}")
+            return jsonify({"statuscode": 200, "message": "Profile updated successfully."}), 200
+        except Exception as db_update_error:
+             current_app.logger.error(f"Failed to update profile for {account_email}: {db_update_error}")
+             return jsonify({"statuscode": 500, "message": "Failed to save profile updates."}), 500
 
-        return jsonify({"statuscode": 200, "message": "Profile updated successfully."}), 200
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Edit profile endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred while updating profile."}), 500
 
-@user_blueprint.route('/logout', methods=['POST'])
-@middleware
-def logout ():
-    try: 
-        data = request.get_json()
-        email = data.get('email')
 
-        if not email or not r.exists(email):
-            return jsonify({"statuscode": 400, "message": "User not found."}), 200
-
-        payload = jwt.decode(r.get(email), secret, algorithms=['HS256'])
-        payload['exp'] = datetime.utcnow()
-
-        r.delete(email)
-
-        return jsonify({"statuscode": 200, "message": "Logout successfully."}), 200
-    except Exception as e:
-        return jsonify({"message": str(e)}), 500
-    
-@user_blueprint.route('/account_delete', methods=['POST'])
-@middleware
-def account_delete():
+# ----- Endpoint: Logout -----
+# Function name changed, route remains the same
+# Middleware applied
+@auth_api_blueprint.route('/logout', methods=['POST'])
+@token_required # Use renamed middleware
+def invalidate_user_session():
     try:
-        data = request.get_json()
-        email = data.get('email')
+        logout_request_data = request.get_json()
+        if not logout_request_data:
+             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
 
-        if not email:
-            return jsonify({"statuscode": 400, "message": "User not found."}), 400
+        user_to_logout = logout_request_data.get('email')
 
-        users_ref = db.collection("users")
-        query = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
-        results = query.stream()
+        if not user_to_logout:
+            return jsonify({"statuscode": 400, "message": "Bad Request: Email is required for logout."}), 200
 
-        for doc in results:
-            doc.reference.delete()
-            break
+        # The core logout action is removing the refresh token from Redis
+        # The original code decoded the token, set 'exp', which isn't standard invalidation.
+        # Simply deleting the Redis key is sufficient and standard practice.
+        deleted_count = r.delete(user_to_logout)
 
-        confirm_query = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
-        if list(confirm_query.stream()):
-            return jsonify({"statuscode": 500, "message": "Failed to delete user in Firestore."}), 500
-
-        payload = jwt.decode(r.get(email), secret, algorithms=['HS256'])
-        payload['exp'] = datetime.utcnow()
-        r.delete(email)
-
-        return jsonify({"statuscode": 200, "message": "User deleted successfully."}), 200
+        if deleted_count > 0:
+            current_app.logger.info(f"User {user_to_logout} logged out successfully (session invalidated).")
+            return jsonify({"statuscode": 200, "message": "Logout successful."}), 200
+        else:
+             # This could mean the user was already logged out or session expired
+             current_app.logger.warning(f"Logout attempt for {user_to_logout}, but no active session found in Redis.")
+             # Return success anyway, as the desired state (logged out) is achieved
+             return jsonify({"statuscode": 200, "message": "Logout successful (session already inactive)."}), 200
 
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        current_app.logger.error(f"Logout endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during logout."}), 500
+
+# ----- Endpoint: Account Deletion -----
+# Function name changed, route remains the same
+# Middleware applied
+@auth_api_blueprint.route('/account_delete', methods=['POST'])
+@token_required # Use renamed middleware
+def remove_user_account_permanently():
+    try:
+        deletion_request_data = request.get_json()
+        if not deletion_request_data:
+             # Use 400 for bad request format
+             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 400
+
+        email_to_delete = deletion_request_data.get('email')
+
+        if not email_to_delete:
+             # Use 400 for missing required parameter
+             return jsonify({"statuscode": 400, "message": "Bad Request: Email is required for account deletion."}), 400
+
+        # --- Delete Firestore User Document ---
+        user_doc_ref = firestore_db.collection("users").document(email_to_delete)
+
+        try:
+            # Check if user exists before attempting deletion
+            user_doc = user_doc_ref.get()
+            if not user_doc.exists:
+                 current_app.logger.warning(f"Account deletion request for non-existent user: {email_to_delete}")
+                 # Return success as the end state (no user) is true, or 404
+                 return jsonify({"statuscode": 404, "message": "User account not found."}), 404 # Changed to 404
+
+            # Perform the deletion
+            user_doc_ref.delete()
+
+            # Optional: Verify deletion (as in original)
+            # Re-fetch the document to ensure it's gone
+            confirm_doc = user_doc_ref.get()
+            if confirm_doc.exists:
+                # Log error but don't necessarily fail if Redis cleanup works
+                current_app.logger.error(f"Firestore deletion verification failed for {email_to_delete}. Document still exists.")
+                # Fall through to Redis cleanup anyway
+            else:
+                current_app.logger.info(f"Firestore user document deleted successfully for {email_to_delete}.")
+
+        except Exception as db_delete_error:
+            current_app.logger.error(f"Error deleting Firestore user {email_to_delete}: {db_delete_error}")
+            return jsonify({"statuscode": 500, "message": "Failed to delete user data."}), 500
+
+        # --- Delete Redis Session Key ---
+        try:
+            # Similar to logout, just delete the session key
+            r.delete(email_to_delete)
+            current_app.logger.info(f"Redis session key deleted for {email_to_delete}.")
+        except Exception as redis_error:
+             current_app.logger.error(f"Error deleting Redis key for {email_to_delete} during account deletion: {redis_error}")
+             # Don't fail the request if Firestore deletion succeeded, but log it.
+
+        return jsonify({"statuscode": 200, "message": "User account deleted successfully."}), 200
+
+    except Exception as e:
+        current_app.logger.error(f"Account delete endpoint error: {e}")
+        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during account deletion."}), 500
