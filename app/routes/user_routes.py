@@ -33,7 +33,6 @@ auth_api_blueprint = Blueprint('users', __name__) # Route prefix remains 'users'
 # Renamed regex variables for clarity and distinction
 EMAIL_VALIDATION_PATTERN = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 PASSWORD_STRENGTH_PATTERN = r'^(?=.*[A-Z])(?=.*[!@#$%^&*])[A-Za-z\d!@#$%^&*]{8,}$'
-UK_PHONE_REGEX = r"^44\d{9,10}$" # Specific to UK format as in original
 
 # ----- Authentication Middleware -----
 # Renamed 'middleware' to 'token_required' for clearer intent
@@ -180,7 +179,6 @@ def handle_user_login():
         user_profile_info = {
             "name": user_data.get('name'),
             "email": user_data.get('email'),
-            "phone": user_data.get('phone'), # Include phone if available
         }
 
         # Generate captcha challenge
@@ -301,7 +299,7 @@ def process_captcha_and_continue():
         user_info_for_response = { # Prepare response structure early
             "name": cached_user_data.get('name'),
             "email": cached_user_data.get('email'),
-            "phone": cached_user_data.get('phone', ""), # Default to empty string if no phone yet
+            "login": is_login_flow
         }
 
         # If it was the SIGNUP flow, create the user now
@@ -323,7 +321,6 @@ def process_captcha_and_continue():
                     "name": cached_user_data.get('name'),
                     "email": cached_user_data.get('email'),
                     "password": hashed_user_password,
-                    "phone": None, # Initialize phone as null or empty
                     "created_at": firestore.SERVER_TIMESTAMP # Add creation timestamp
                 }
 
@@ -480,7 +477,6 @@ def confirm_email_with_code():
                 current_app.logger.error(f"Failed to generate/store tokens for {subject_email}: {token_error}")
                 return jsonify({"statuscode": 500, "message": "Email verified, but failed to issue session tokens."}), 500
         else:
-             # If not the final login step (e.g., just verifying after signup before adding phone)
              # Optional: Update user record in Firestore to mark email as verified
              try:
                  firestore_db.collection("users").document(subject_email).update({"email_verified": True, "email_verified_at": firestore.SERVER_TIMESTAMP})
@@ -494,173 +490,6 @@ def confirm_email_with_code():
     except Exception as e:
         current_app.logger.error(f"Verify email endpoint error: {e}")
         return jsonify({"statuscode": 500, "message": "An unexpected error occurred during email verification."}), 500
-
-
-# ----- Endpoint: Add Phone Number -----
-# Function name changed, route remains the same
-# Applying token_required middleware as sensitive user data is modified
-@auth_api_blueprint.route('/add_phone', methods=['POST'])
-def associate_phone_number_to_account():
-    try:
-        phone_data_payload = request.get_json()
-        if not phone_data_payload:
-             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
-
-        account_email = phone_data_payload.get('email')
-        phone_to_add = phone_data_payload.get('phone')
-
-        if not account_email or not phone_to_add:
-            return jsonify({"statuscode": 400, "message": "Email and phone number are required."}), 200
-
-        # Validate phone format (using the UK specific regex from original)
-        if not re.match(UK_PHONE_REGEX, phone_to_add):
-            return jsonify({"statuscode": 400, "message": "Invalid phone number format (must be UK format starting with 44)."}), 200
-
-        # Find user document - Use direct get since email should be unique doc ID
-        user_collection = firestore_db.collection("users")
-        user_doc_ref = user_collection.document(account_email)
-        user_record = user_doc_ref.get()
-
-        if not user_record.exists:
-            return jsonify({"statuscode": 404, "message": "User account not found."}), 200 # Use 404
-
-        # Update phone number in Firestore
-        try:
-            user_doc_ref.update({"phone": phone_to_add, "phone_added_at": firestore.SERVER_TIMESTAMP})
-        except Exception as db_update_error:
-             current_app.logger.error(f"Failed to update phone for {account_email}: {db_update_error}")
-             return jsonify({"statuscode": 500, "message": "Failed to save phone number."}), 500
-
-
-        # Generate and cache OTP for phone verification
-        sms_otp_code = generate_otp()
-        print("OTP:", sms_otp_code)
-        otp_cache_key = f"{account_email}_sms_otp"
-        cache.set(otp_cache_key, sms_otp_code, timeout=300) # 5 minutes validity
-
-        # Send OTP via SMS (Commented out as per original, uncomment to enable)
-        try:
-            current_app.logger.info(f"Generated OTP for {account_email} / {phone_to_add}: {sms_otp_code}") # Log OTP for debugging if SMS is off
-            # send_sms(phone_to_add, f"Your verification code is: {sms_otp_code}")
-            # current_app.logger.info(f"Sent OTP SMS to {phone_to_add}")
-            pass # Remove pass if send_sms is uncommented
-        except Exception as sms_error:
-            current_app.logger.error(f"Failed to send OTP SMS to {phone_to_add}: {sms_error}")
-            # Don't fail the whole request yet, phone was added to DB. Maybe alert user.
-            return jsonify({
-                 "statuscode": 200, # Phone added, but SMS failed
-                 "message": "Phone number added, but failed to send OTP. Please try resending."
-            }), 200
-
-        return jsonify({"statuscode": 200, "message": "Phone number added. Please verify with the OTP sent."}), 200
-
-    except Exception as e:
-        current_app.logger.error(f"Add phone endpoint error: {e}")
-        return jsonify({"statuscode": 500, "message": "An unexpected error occurred while adding phone number."}), 500
-
-
-# ----- Endpoint: Resend SMS OTP -----
-# Function name changed, route remains the same
-# Applying token_required middleware
-@auth_api_blueprint.route('/resend_otp', methods=['POST'])
-def request_new_sms_otp():
-    try:
-        otp_request_data = request.get_json()
-        if not otp_request_data:
-             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
-
-        target_email = otp_request_data.get('email')
-        # Optional: Include phone in request to ensure it matches DB, or fetch from DB
-        # target_phone = otp_request_data.get('phone') # If provided by client
-
-        if not target_email: # Removed phone check here, fetch from DB instead
-            return jsonify({"statuscode": 400, "message": "Bad Request: Email is required."}), 200
-
-        # Fetch user data to get the registered phone number
-        user_doc = firestore_db.collection("users").document(target_email).get()
-
-        if not user_doc.exists:
-            return jsonify({"statuscode": 404, "message": "User account not found."}), 200 # Use 404
-
-        user_data = user_doc.to_dict()
-        registered_phone = user_data.get('phone')
-
-        if not registered_phone:
-             return jsonify({"statuscode": 400, "message": "No phone number associated with this account."}), 200
-
-        # Generate a new OTP and cache it
-        new_sms_otp = generate_otp()
-        print("OTP:", new_sms_otp)
-        otp_cache_key = f"{target_email}_sms_otp" # Consistent key naming
-        cache.set(otp_cache_key, new_sms_otp, timeout=300) # 5 minutes validity
-
-        # Send the new OTP via SMS (Commented out as per original)
-        try:
-            current_app.logger.info(f"Generated new OTP for {target_email} / {registered_phone}: {new_sms_otp}") # Log OTP
-            # send_sms(registered_phone, f"Your new verification code is: {new_sms_otp}")
-            # current_app.logger.info(f"Resent OTP SMS to {registered_phone}")
-            pass # Remove pass if uncommented
-        except Exception as sms_error:
-            current_app.logger.error(f"Failed to resend OTP SMS to {registered_phone}: {sms_error}")
-            return jsonify({"statuscode": 500, "message": "Failed to resend OTP SMS."}), 500
-
-        return jsonify({"statuscode": 200, "message": "New OTP sent successfully."}), 200
-
-    except Exception as e:
-        current_app.logger.error(f"Resend OTP endpoint error: {e}")
-        return jsonify({"statuscode": 500, "message": "An unexpected error occurred while resending OTP."}), 500
-
-
-# ----- Endpoint: Verify SMS OTP -----
-# Function name changed, route remains the same
-# Applying token_required middleware
-@auth_api_blueprint.route('/verify_otp', methods=['POST'])
-def confirm_phone_with_otp():
-    try:
-        otp_submission_payload = request.get_json()
-        if not otp_submission_payload:
-             return jsonify({"statuscode": 400, "message": "Bad Request: Missing JSON body."}), 200
-
-        user_email = otp_submission_payload.get('email')
-        submitted_otp = otp_submission_payload.get('otp')
-
-        if not user_email or not submitted_otp:
-            return jsonify({"statuscode": 400, "message": "Bad Request: Email and OTP required."}), 200
-
-        # Check cache for the OTP code
-        otp_cache_key = f"{user_email}_sms_otp"
-        cached_otp = cache.get(otp_cache_key)
-
-        # Debugging logs from original kept for reference, modified slightly
-        # current_app.logger.debug(f"Verifying OTP for {user_email}. Submitted: {submitted_otp}. Cached: {cached_otp}")
-
-        if cached_otp is None:
-            return jsonify({"statuscode": 400, "message": "OTP code expired or was never sent."}), 200
-
-        if cached_otp != submitted_otp:
-            # Increment failure count here? Rate limiting?
-            return jsonify({"statuscode": 400, "message": "Invalid OTP code provided."}), 200
-
-        # --- Actions after successful OTP verification ---
-        cache.delete(otp_cache_key) # OTP used, delete it
-
-        # Optional: Update user record in Firestore to mark phone as verified
-        try:
-            firestore_db.collection("users").document(user_email).update({
-                "phone_verified": True,
-                "phone_verified_at": firestore.SERVER_TIMESTAMP
-            })
-            current_app.logger.info(f"Phone number verified for {user_email}.")
-        except Exception as db_update_error:
-            current_app.logger.error(f"Failed to mark phone as verified in DB for {user_email}: {db_update_error}")
-            # Log error but proceed, verification itself was successful
-
-        # Changed success message for clarity
-        return jsonify({"statuscode": 200, "message": "Phone number verified successfully."}), 200
-
-    except Exception as e:
-        current_app.logger.error(f"Verify OTP endpoint error: {e}")
-        return jsonify({"statuscode": 500, "message": "An unexpected error occurred during OTP verification."}), 500
 
 
 # ----- Endpoint: Change Password -----
@@ -823,7 +652,6 @@ def modify_user_profile_details():
 
         account_email = profile_update_data.get('email')
         updated_name = profile_update_data.get('name')
-        # Add other fields here if editable, e.g., updated_phone = profile_update_data.get('phone')
 
         if not account_email or not updated_name: # Add other required fields to check
             return jsonify({"statuscode": 400, "message": "Required profile fields are missing (email, name)."}), 200
@@ -831,12 +659,10 @@ def modify_user_profile_details():
         # Validate updated data
         if len(updated_name) < 3:
             return jsonify({"statuscode": 400, 'message': "Name must contain at least 3 characters."}), 200
-        # Add validation for other fields if needed (e.g., phone format)
 
         # Prepare update payload for Firestore
         update_payload = {
             "name": updated_name,
-            # Add other fields: "phone": updated_phone,
             "profile_last_updated_at": firestore.SERVER_TIMESTAMP
         }
 
